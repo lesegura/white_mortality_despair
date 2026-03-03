@@ -1,0 +1,322 @@
+---
+title: "Association between changing despair and changing deaths of despair"
+author: "Luis E Segura"
+date: "2023-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+
+options(tinytex.verbose = TRUE, scipen = 999)
+
+mypckgs <- c("tidyverse", "here", "survey", "srvyr", "nlme", "foreach")
+
+for (package in mypckgs) {
+  library(package, character.only = T)
+}
+
+```
+
+## Data prep and recoding
+```{r}
+### loading national CDC mortality data between 1999 and 2016
+load(here("data/", "data_deaths_v2.RData"))
+
+### some recoding
+data_deaths <- data_deaths |> 
+  mutate(select = ifelse(age_cat == 9 & age_yrs < 18, 0, 1)) |>
+  filter(select == 1 & year < 2017) |>
+  mutate(age_cat2 = factor(case_when(age_cat == 9 | age_cat == 10 ~ 1, 
+                              age_cat == 11 ~ 2, 
+                              age_cat == 12 ~ 3, 
+                              age_cat == 13 ~ 4, 
+                              age_cat == 14 ~ 5, 
+                              age_cat == 15 ~ 6, 
+                              age_cat == 16 ~ 7, 
+                              age_cat == 17 ~ 8, 
+                              age_cat == 18 ~ 9,
+                              age_cat == 19 ~ 10, 
+                              age_cat == 20 ~ 11, 
+                              age_cat == 21 ~ 12, 
+                              age_cat > 21 & age_cat < 27 ~ 13, 
+                              age_cat == 27 ~ NA), 
+                           labels = c("18 - 24 yo", "25 - 29 yo", "30 - 34 yo", 
+                                     "35 - 39 yo", "40 - 44 yo", "45 - 49 yo", 
+                                     "50 - 54 yo", "55 - 59 yo", "60 - 64 yo", 
+                                     "65 - 69 yo", "70 - 74 yo", "75 - 79 yo", 
+                                     "80+ yo")), 
+         year_c = year - 1998, 
+         deaths_despair = rowSums(pick(od_deaths, suicides, alc.liver.cirr))) |>
+  select(!age_cat) |>
+  rename(age_cat = age_cat2, 
+         education = educ_cat, 
+         race = race_rec) 
+
+
+death_educ <- data_deaths |>
+  mutate(midlife = ifelse(age_cat %in% c("45 - 49 yo", "50 - 54 yo"), 1, 0)) |>
+  filter(midlife == 1 & race != "NH Other race") |>
+  droplevels() |>
+  group_by(year_c, education, race) |>
+  summarize(deaths_despair = sum(deaths_despair), 
+            od_deaths = sum(od_deaths), 
+            suicides = sum(suicides), 
+            alc.liver.cirr = sum(alc.liver.cirr), .groups = "drop")  |>
+  drop_na()
+
+### Load population estimates for denominators of mortality rates from the Current Population Survey.
+load(here("data/", "pop_estimates_99_16.RData"))
+
+pop_educ <- pop_estimates_99_16 |>
+  mutate(midlife = ifelse(age_cat %in% c("45-49", "50-54"), 1, 0)) |>
+  filter(midlife == 1) |>
+  group_by(year, education, race) |>
+  summarise(population = sum(population), .groups = "drop") |>
+  mutate(year_c = year - 1998) |>
+  select(!year)
+
+### calculate mortality rates between 2000 - 2016. This is the time series of $death_{t} = death_{t = 2000} + ... + death_{t = 2016}$ 
+data_midlife_educ_nolag <- death_educ |>
+  filter(year_c > 1) |>
+  left_join(pop_educ |> filter(year_c > 1), by = c("year_c", "race", "education")) |>
+  mutate(year_c = year_c - 1, ### to not have missings I am going to make year_c start at 1 for both the lag and not lagged mortality rate.
+         dod_rate = (deaths_despair / population) * 100000,
+         overdose_rate = (od_deaths / population) * 100000,
+         suicide_rates = (suicides / population) * 100000,
+         alcohol_rates = (alc.liver.cirr / population) * 100000,
+         log_year = log(year_c)) |>
+  select(year_c, log_year, race, education, dod_rate, overdose_rate, suicide_rates, alcohol_rates)
+
+### calculate mortality rates between 1999 - 2015. This is the lagged time series of $death_{t} = death_{t = 1999} + ... + death_{t = 2015}$ 
+data_midlife_educ_lag <- death_educ |>
+  filter(year_c < 18) |>
+  left_join(pop_educ |> filter(year_c < 18), by = c("year_c", "race", "education")) |>
+  mutate(lag_dod_rate = (deaths_despair / population) * 100000,
+         lag_overdose_rate = (od_deaths / population) * 100000,
+         lag_suicide_rates = (suicides / population) * 100000,
+         lag_alcohol_rates = (alc.liver.cirr / population) * 100000) |>
+  select(year_c, race, education, lag_dod_rate, lag_overdose_rate, lag_suicide_rates, lag_alcohol_rates)
+
+### load data on confounders
+load(here("data/", "confounders_midlife_educ_between.RData"))
+
+confounders_midlife <- confounders_midlife_educ |>
+  filter(year < 2014) |>
+  mutate(year_c = year - 1996) |>
+  select(!year) |>
+  select(year_c, everything())
+
+### join both death datasets, all columns now have the same length
+data_midlife_educ <- left_join(data_midlife_educ_nolag, 
+                               data_midlife_educ_lag, by = c("year_c", "race", "education")) |>
+  left_join(confounders_midlife, by = c("year_c", "race", "education"))
+  
+```
+
+```{r}
+### loading NHIS survey years 1997-2014 to estimate despair and other covariates.
+load(here("data/", "sample_adult_confounders_sense.RData"))
+
+samadult_midlife <- samadult_confounders_sens |>
+  ### some recoding
+  mutate(deceased = case_when(mortstat == 1 ~ 1, 
+                              is.na(mortstat) ~ 0, 
+                              mortstat == 0 ~ 0), 
+         deceased.fct = factor(deceased, labels = c("Not deceased", "Deceased")), 
+         age_cat = factor(case_when(age > 17 & age < 25 ~ 1, 
+                             age > 24 & age < 30 ~ 2, 
+                             age > 29 & age < 35 ~ 3, 
+                             age > 34 & age < 40 ~ 4, 
+                             age > 39 & age < 45 ~ 5, 
+                             age > 44 & age < 50 ~ 6, 
+                             age > 49 & age < 55 ~ 7, 
+                             age > 54 & age < 60 ~ 8, 
+                             age > 59 & age < 65 ~ 9, 
+                             age > 64 & age < 70 ~ 10, 
+                             age > 69 & age < 75 ~ 11, 
+                             age > 74 & age < 80 ~ 12, 
+                             age > 79 ~ 13), 
+                          labels = c("18 - 24 yo", "25 - 29 yo", "30 - 34 yo", 
+                                     "35 - 39 yo", "40 - 44 yo", "45 - 49 yo", 
+                                     "50 - 54 yo", "55 - 59 yo", "60 - 64 yo", 
+                                     "65 - 69 yo", "70 - 74 yo", "75 - 79 yo", 
+                                     "80+ yo")), 
+         new_wt = wtfa_sa / 16) |>
+  filter(race != "NH Other race groups") |>
+  droplevels() |>
+  filter(midlife == 1) 
+
+### survey design and weighting
+adult_design <- samadult_midlife |> 
+  as_survey_design(id = psu,
+                   strata = stratum, 
+                   weights = new_wt, 
+                   nest = TRUE) 
+
+```
+
+```{r}
+
+### Setting adult replicates
+set.seed(1234)
+
+boot_design <- svrep::as_bootstrap_design(adult_design, replicates = 500)
+
+## replicate weights matrix: n x k
+rep_wts <- weights(boot_design, type = "analysis")
+
+boot_reps <- seq(from = 1, to = ncol(rep_wts), by = 1)
+
+
+### AR model to estimate the association between changing (delta) despair and changing (delta) deaths of despair
+
+adj_results <- vector(mode = "list", length = max(boot_reps))
+
+for(i in seq_along(boot_reps)) {
+  
+  resampled_data <- samadult_midlife |>
+    mutate(boot_wts = as.numeric(rep_wts[, i]))
+  
+  despair_data <- resampled_data |> 
+    group_by(year, educ_fct, race) |>
+    summarise(despair = weighted.mean(hopeless_num, boot_wts, na.rm = T), .groups = "drop") |>
+    drop_na() |>
+    droplevels() |>
+    rename(education = educ_fct) |>
+    filter(year > 1997) |>
+    mutate(year_c = year - 1997) |>
+    select(-year) |>
+    arrange(year_c, education, race)
+  
+  despair_lag_data <- resampled_data |> 
+    group_by(year, educ_fct, race) |>
+    summarise(despair_lag = weighted.mean(hopeless_num, new_wt, na.rm = T), .groups = "drop") |>
+    drop_na() |>
+    droplevels() |>
+    rename(education = educ_fct) |>
+    filter(year < 2014) |>
+    mutate(year_c = year - 1996) |>
+    select(-year) |>
+    arrange(year_c, education, race)
+  
+  despair_data_merge <- left_join(despair_data, despair_lag_data, by = c("year_c", "education", "race")) |>
+    mutate(delta_despair = despair - despair_lag)
+  
+  data_educ <- data_midlife_educ |>
+    left_join(despair_data_merge, by = c("year_c", "race", "education")) |>
+    mutate(race = fct_relevel(race, "Hispanics")) |>
+    arrange(year_c, race) |>
+    tsibble::as_tsibble(key = c(race, education), index = year_c) 
+  
+  ### DOD models
+  ar_dod <- tryCatch(gls(dod_rate ~ lag_dod_rate + delta_despair * race * education + not_married_rt + 
+                 not_labor_force_rt + unemployed_rt + no_insurance_rt + union_mem_rt + below_fpl_rt, 
+                       data = data_educ, 
+                     correlation = corAR1(form = ~ 1)), 
+                 error = function(e) NULL)
+  
+   if(is.null(ar_dod)) {
+    adj_results[[i]] <- tibble::tibble(replicate = i, ok = F)
+    next
+  }
+  
+  ar_overdose <- tryCatch(gls(overdose_rate ~ lag_overdose_rate + delta_despair * race * education + not_married_rt + 
+                 not_labor_force_rt + unemployed_rt + no_insurance_rt + union_mem_rt + below_fpl_rt, 
+                       data = data_educ, 
+                     correlation = corAR1(form = ~ 1)), 
+                 error = function(e) NULL)
+  
+    if(is.null(ar_overdose)) {
+    adj_results[[i]] <- tibble::tibble(replicate = i, ok = F)
+    next
+  }
+  
+  ar_suicide <- tryCatch(gls(suicide_rates ~ lag_suicide_rates + delta_despair * race * education + not_married_rt + 
+                 not_labor_force_rt + unemployed_rt + no_insurance_rt + union_mem_rt + below_fpl_rt, 
+                       data = data_educ, 
+                     correlation = corAR1(form = ~ 1)), 
+                 error = function(e) NULL)
+  
+  if(is.null(ar_suicide)) {
+    adj_results[[i]] <- tibble::tibble(replicate = i, ok = F)
+    next
+  }
+  
+  ar_alcohol <- tryCatch(gls(alcohol_rates ~ lag_alcohol_rates + delta_despair * race * education + not_married_rt + 
+                 not_labor_force_rt + unemployed_rt + no_insurance_rt + union_mem_rt + below_fpl_rt, 
+                       data = data_educ, 
+                     correlation = corAR1(form = ~ 1)), 
+                 error = function(e) NULL)
+  
+    if(is.null(ar_alcohol)) {
+    adj_results[[i]] <- tibble::tibble(replicate = i, ok = F)
+    next
+  }
+  
+  ### standardization via g-formula to estimate the effect of delta_despair on change in mortality rates_t given mortality_rates_t-1. 
+  model_dod_slopes <- ar_dod |>
+    marginaleffects::avg_slopes(variables = "delta_despair", 
+                            by = c("race", "education")) |>
+    broom::tidy() |>
+    mutate(outcome = "deaths of despair", 
+           replicate = i, ok = T) |>
+    relocate(outcome, .before = term)
+  
+  model_overdose_slopes <- ar_overdose |>
+    marginaleffects::avg_slopes(variables = "delta_despair", 
+                            by = c("race", "education")) |>
+    broom::tidy() |>
+    mutate(outcome = "overdoses", 
+           replicate = i, ok = T) |>
+    relocate(outcome, .before = term)
+
+  
+  model_suicide_slopes <- ar_suicide |>
+    marginaleffects::avg_slopes(variables = "delta_despair", 
+                            by = c("race", "education")) |>
+    broom::tidy() |>
+    mutate(outcome = "suicides", 
+           replicate = i, ok = T) |>
+    relocate(outcome, .before = term)
+
+  
+  model_alcohol_slopes <- ar_alcohol |>
+    marginaleffects::avg_slopes(variables = "delta_despair", 
+                            by = c("race", "education")) |>
+    broom::tidy() |>
+    mutate(outcome = "alcohol", 
+           replicate = i, ok = T) |>
+    relocate(outcome, .before = term)
+  
+  
+  model_slopes <- model_dod_slopes |>
+    bind_rows(model_overdose_slopes, model_suicide_slopes, model_alcohol_slopes)
+  
+  
+  adj_results[[i]] <- model_slopes
+
+}
+
+```
+
+```{r}
+multicontrast <- adj_results |>
+  bind_rows() |>
+  filter(ok) |>
+  group_by(outcome, race, education) |>
+  summarise(estimate_boot = mean(estimate), 
+            sd_boot = sd(estimate), 
+            ll_ci_wald = estimate_boot - (1.96 * sd_boot), 
+            ul_ci_wald = estimate_boot + (1.96 * sd_boot), 
+            ll_ci_pct = quantile(estimate, 0.025), 
+            ul_ci_pct = quantile(estimate, 0.975), 
+            beta_used = n(), .groups = "drop") 
+
+
+write_csv(multicontrast, here("Results/", "aim3_delta_adj_estimates.csv"))
+
+```
+
+
