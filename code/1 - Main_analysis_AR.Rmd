@@ -8,10 +8,12 @@ output: html_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 
+options(mc.cores = parallel::detectCores())
 
 options(tinytex.verbose = TRUE, scipen = 999)
 
-mypckgs <- c("tidyverse", "here", "survey", "srvyr", "nlme", "foreach")
+mypckgs <- c("tidyverse", "here", "survey", "srvyr", "nlme", "foreach",
+             "brms", "collapse", "marginaleffects")
 
 for (package in mypckgs) {
   library(package, character.only = T)
@@ -141,7 +143,7 @@ samadult_midlife <- samadult_confounders_sens |>
 
 ```
 
-```{r}
+```{r, message=FALSE}
 ### survey design and weighting
 adult_design <- samadult_midlife |> 
   as_survey_design(id = psu,
@@ -152,15 +154,15 @@ adult_design <- samadult_midlife |>
 
 ### Setting adult bootstrap replicate weights
 set.seed(1234)
+replicates <- 5#500
 
 
-boot_design <- svrep::as_bootstrap_design(adult_design, replicates = 500)
+boot_design <- svrep::as_bootstrap_design(adult_design, replicates = replicates)
 
 ## replicate weights matrix: n x k
 rep_wts <- weights(boot_design, type = "analysis")
 
 boot_reps <- seq(from = 1, to = ncol(rep_wts), by = 1)
-
 
 ### AR model to estimate the association between changing (delta) despair and changing (delta) all-cause mortality
 
@@ -201,13 +203,31 @@ for(i in seq_along(boot_reps)) {
   data_educ <- data_midlife_educ |>
     left_join(despair_data_merge, by = c("year_c", "race", "education")) |>
     mutate(race = fct_relevel(race, "Hispanics")) |>
-    arrange(year_c, race) |>
-    tsibble::as_tsibble(key = c(race, education), index = year_c) 
+    arrange(year_c, race) #|>
   
-  model <- tryCatch(gls(death_rate ~ lag_death_rate + delta_despair * race * education + not_married_rt + 
-                 not_labor_force_rt + unemployed_rt + no_insurance_rt + union_mem_rt + below_fpl_rt, 
-                       data = data_educ, 
-                     correlation = corAR1(form = ~ 1)), error = function(e) NULL)
+  data_educ <- data_educ |> 
+    arrange(race, education) |> 
+    group_by(year_c) |> 
+    mutate(grp = 1:n()) |> 
+    ungroup()
+    #tsibble::as_tsibble(key = c(race, education), index = year_c) 
+  print(i)
+  
+  if (i == 1){
+    model <- #tryCatch(
+      brm(death_rate ~ ar(p = 1,  gr = grp, time = year_c) + delta_despair * race * education + not_married_rt + 
+                   not_labor_force_rt + unemployed_rt + no_insurance_rt + union_mem_rt + below_fpl_rt,
+                refresh = 0,
+                # family = gaussian(),
+                # prior  = c(
+                #   prior(normal(0, 10), class = b),
+                #   prior(cauchy(0, 2.5), class = sigma)
+                # ),
+                data = data_educ)#,
+      #error = function(e) NULL)
+  } else {
+    model <- update(model, newdata = data_educ, recompile = F)
+  }
   
   if(is.null(model)) {
     adj_results[[i]] <- tibble::tibble(replicate = i, ok = F)
@@ -216,8 +236,7 @@ for(i in seq_along(boot_reps)) {
   
   ### standardization via g-formula to estimate the effect of delta_despair on change in mortality rates_t given mortality_rates_t-1. 
   adj_results[[i]] <- model |>
-    marginaleffects::avg_slopes(variables = "delta_despair", 
-                            by = c("race", "education")) |>
+    avg_slopes(variables = "delta_despair", by = c("race", "education"), incl_autocor = FALSE) |>
     broom::tidy() |>
     mutate(replicate = i, ok = T)
 
@@ -228,7 +247,6 @@ save(adj_results, file = here("data/", "ar_adj_results.RData"))
 ```
 
 ```{r}
-
 multicontrast <- adj_results |>
   bind_rows() |>
   filter(ok) |>
