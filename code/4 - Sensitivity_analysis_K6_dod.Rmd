@@ -235,7 +235,7 @@ for(i in seq_along(boot_reps)) {
         refresh = 0, 
         data = data_educ), error = function(e) NULL)
   } else {
-    ar_dod <- tryCacth(
+    ar_dod <- tryCatch(
       update(ar_dod, newdata = data_educ, recompile = F), 
       error = function(e) NULL)
   }
