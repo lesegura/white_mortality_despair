@@ -264,3 +264,56 @@ write_csv(multicontrast, here("Results/", "delta_adj_estimates_bayes.csv"))
 
 ```
 
+```{r}
+load(here("data/", "ar_adj_results_bayes.RData"))
+
+plot_cummean <- adj_results |>
+  bind_rows() |>
+  group_by(race, education) |>
+  arrange(replicate) |>
+  mutate(running_mean = GMCM:::cummean(estimate)) |>
+  ungroup() |>
+  ggplot() +
+  geom_line(aes(x = replicate, y = running_mean, colour = "red")) +
+  # scale_x_continuous(breaks = seq(1, 500, 10)) +
+  # expand_limits(x = c(1, 500)) +
+  theme_classic() + 
+  theme(legend.position = "none") + 
+  ylab("running mean of estimates") +
+  facet_grid(education ~ race)
+
+ggsave(plot = plot_cummean, 
+       filename = here("Results/", "plot_cummean_bayes.png"), 
+       device = "png", width = 12, 
+       height = 8, units = "in", 
+       dpi = 1200)
+
+```
+
+### Precision of bootstrap standard errors
+```{r}
+plot_boot_precision <- adj_results |>
+  bind_rows() |>
+  group_by(race, education) |>
+  arrange(replicate) |>
+  summarise(B = n(), 
+         se_boot = sd(estimate, na.rm = TRUE), 
+         mcse_se = se_boot / sqrt(2 * (B - 1)),
+         mcse_ratio = mcse_se / se_boot,
+         .groups = "drop") |>
+  ggplot(aes(x = race, y = mcse_ratio, fill = education)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0.10, linetype = "dashed", color = "red") +
+  theme_classic() + 
+  theme(legend.position = "none") + 
+  labs(y = "Monte Carlo error / Bootstrap SE",
+       x = "") +
+  facet_wrap(~ education)
+
+ggsave(plot = plot_boot_precision, 
+       filename = here("Results/", "plot_boot_precision_bayes.png"), 
+       device = "png", width = 12, 
+       height = 8, units = "in", 
+       dpi = 1200)
+
+```
